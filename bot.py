@@ -17,18 +17,12 @@ logger = logging.getLogger(__name__)
 # --- Helpers ---
 
 TIKTOK_URL_PATTERN = re.compile(
-    r"(https?://)?(www\.)?(vm\.tiktok\.com|tiktok\.com|vt\.tiktok\.com)"
-    r"(/[^\s]*)?"
+    r"https?://(?:www\.|vm\.|vt\.)?tiktok\.com/[^\s]+"
 )
 
-def is_tiktok_url(text: str) -> bool:
-    return bool(TIKTOK_URL_PATTERN.search(text))
-
-def extract_tiktok_url(text: str) -> str | None:
-    match = TIKTOK_URL_PATTERN.search(text)
-    if match:
-        return match.group(0)
-    return None
+def find_tiktok_urls(text: str) -> list[str]:
+    """Find all TikTok URLs in a message."""
+    return TIKTOK_URL_PATTERN.findall(text)
 
 def download_tiktok_video(url: str, output_dir: str) -> str:
     """Download a TikTok video using yt-dlp. Returns the path to the MP4 file."""
@@ -40,14 +34,12 @@ def download_tiktok_video(url: str, output_dir: str) -> str:
         "merge_output_format": "mp4",
         "quiet": True,
         "no_warnings": True,
-        # Remove TikTok watermark when possible
         "extractor_args": {"tiktok": {"embed_metadata": False}},
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
-        # Ensure .mp4 extension
         if not filename.endswith(".mp4"):
             base = os.path.splitext(filename)[0]
             filename = base + ".mp4"
@@ -58,57 +50,87 @@ def download_tiktok_video(url: str, output_dir: str) -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Hello! Send me any TikTok link and I'll download it and send it back as an MP4.\n\n"
-        "Just paste a TikTok URL in the chat!"
+        "👋 Hello! Send me one or multiple TikTok links and I'll download them and send them back as MP4 videos.\n\n"
+        "You can send several links in the same message — I'll handle them all!"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
+    urls = find_tiktok_urls(text)
 
-    if not is_tiktok_url(text):
+    if not urls:
         await update.message.reply_text(
             "That doesn't look like a TikTok link. Please send a valid TikTok URL!"
         )
         return
 
-    url = extract_tiktok_url(text)
-    status_msg = await update.message.reply_text("⏳ Downloading your TikTok video...")
+    # Let the user know how many links were found
+    count = len(urls)
+    if count == 1:
+        status_msg = await update.message.reply_text("⏳ Downloading your TikTok video...")
+    else:
+        status_msg = await update.message.reply_text(f"⏳ Found {count} links! Downloading them one by one...")
 
-    try:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            video_path = download_tiktok_video(url, tmp_dir)
+    success = 0
+    failed = 0
 
-            if not os.path.exists(video_path):
-                await status_msg.edit_text("❌ Could not find the downloaded file. The link might be private or unavailable.")
-                return
+    for i, url in enumerate(urls, start=1):
+        # Update status for multiple links so user knows progress
+        if count > 1:
+            await status_msg.edit_text(f"⏳ Downloading video {i} of {count}...")
 
-            file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
-            if file_size_mb > 50:
-                await status_msg.edit_text(
-                    f"❌ The video is too large ({file_size_mb:.1f} MB). "
-                    "Telegram bots can only send files up to 50 MB."
-                )
-                return
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                video_path = download_tiktok_video(url, tmp_dir)
 
-            await status_msg.edit_text("📤 Uploading video...")
+                if not os.path.exists(video_path):
+                    await update.message.reply_text(
+                        f"❌ Video {i}: Could not find the file. The link might be private or unavailable.\n🔗 {url}"
+                    )
+                    failed += 1
+                    continue
 
-            with open(video_path, "rb") as video_file:
-                await update.message.reply_video(
-                    video=video_file,
-                    caption="Here's your TikTok video! 🎵",
-                    supports_streaming=True,
-                )
+                file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+                if file_size_mb > 50:
+                    await update.message.reply_text(
+                        f"❌ Video {i} is too large ({file_size_mb:.1f} MB). Telegram bots can only send files up to 50 MB.\n🔗 {url}"
+                    )
+                    failed += 1
+                    continue
 
-            await status_msg.delete()
+                if count > 1:
+                    await status_msg.edit_text(f"📤 Uploading video {i} of {count}...")
 
-    except yt_dlp.utils.DownloadError as e:
-        logger.error(f"yt-dlp download error: {e}")
-        await status_msg.edit_text(
-            "❌ Failed to download the video. It might be private, deleted, or region-locked."
-        )
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        await status_msg.edit_text("❌ Something went wrong. Please try again.")
+                with open(video_path, "rb") as video_file:
+                    caption = f"🎵 Video {i}/{count}" if count > 1 else "Here's your TikTok video! 🎵"
+                    await update.message.reply_video(
+                        video=video_file,
+                        caption=caption,
+                        supports_streaming=True,
+                    )
+                success += 1
+
+        except yt_dlp.utils.DownloadError as e:
+            logger.error(f"yt-dlp download error for {url}: {e}")
+            await update.message.reply_text(
+                f"❌ Video {i}: Failed to download. It might be private, deleted, or region-locked.\n🔗 {url}"
+            )
+            failed += 1
+        except Exception as e:
+            logger.error(f"Unexpected error for {url}: {e}")
+            await update.message.reply_text(f"❌ Video {i}: Something went wrong. Please try again.\n🔗 {url}")
+            failed += 1
+
+    # Final summary for multiple links
+    if count > 1:
+        if failed == 0:
+            await status_msg.edit_text(f"✅ All {count} videos sent successfully!")
+        elif success == 0:
+            await status_msg.edit_text(f"❌ All {count} downloads failed.")
+        else:
+            await status_msg.edit_text(f"✅ Done! {success} succeeded, {failed} failed.")
+    else:
+        await status_msg.delete()
 
 
 # --- Main ---
